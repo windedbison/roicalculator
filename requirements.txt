@@ -1,4 +1,4 @@
 streamlit
-playwright
+cloudscraper
 beautifulsoup4
 pandas
