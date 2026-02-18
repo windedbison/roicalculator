@@ -1,3 +1,5 @@
 streamlit
-duckduckgo-search
+playwright
+playwright-stealth
+beautifulsoup4
 pandas
