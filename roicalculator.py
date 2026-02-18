@@ -1,13 +1,7 @@
 import streamlit as st
+import cloudscraper
+from bs4 import BeautifulSoup
 import re
-import os
-from playwright.sync_api import sync_playwright
-
-# --- 1. FORCE INSTALL ---
-try:
-    os.system("playwright install chromium")
-except:
-    pass
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Real Estate ROI Calculator", layout="wide")
@@ -17,11 +11,11 @@ if 'scraped_rent' not in st.session_state:
     st.session_state['scraped_rent'] = 0
 if 'data_fetched' not in st.session_state:
     st.session_state['data_fetched'] = False
-if 'debug_text' not in st.session_state:
-    st.session_state['debug_text'] = ""
+if 'debug_info' not in st.session_state:
+    st.session_state['debug_info'] = ""
 
 st.title("🏙️ Real Estate ROI Calculator")
-st.markdown("Automated Scraper using **Google Cache Bypass**.")
+st.markdown("Automated Scraper using **CloudScraper** (Cloudflare Bypass).")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -48,54 +42,51 @@ with st.sidebar:
     occupancy_rate = st.slider("Occupancy (%)", 50, 100, 90)
 
 # --- SCRAPER LOGIC ---
-def parse_clean_number(text):
-    # Turns "150,000", "150, 000" into 150000
+def parse_price(text):
+    # Extracts "150,000" from "AED 150,000"
     clean = re.sub(r'[^\d.]', '', text)
     if clean:
         return int(float(clean))
     return 0
 
-def scrape_data(bayut_url):
-    # Use text-only cache (&strip=1)
-    cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{bayut_url}&strip=1&vwsrc=0"
+def fetch_bayut_cloudscraper(url):
+    # Initialize the solver
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
     
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-            page.goto(cache_url, timeout=45000)
+        # Request the page
+        response = scraper.get(url)
+        
+        if response.status_code != 200:
+            return 0, f"Blocked: {response.status_code}", response.text[:500]
             
-            try:
-                # FIXED: Use content() instead of inner_text()
-                content = page.content()
-                browser.close()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 1. Look for 'Average Yearly Rental'
+        target = soup.find(string=re.compile("Average Yearly Rental"))
+        if target:
+            parent = target.find_parent()
+            full_text = parent.get_text() if parent else ""
+            match = re.search(r'AED\s*([\d,]+)', full_text)
+            if match:
+                return parse_price(match.group(1)), "Success (Bayut Direct)", ""
 
-                if "404." in content and "That’s an error" in content:
-                    return 0, content, "Page not found in Google Cache."
+        # 2. Fallback: Search all text
+        all_text = soup.get_text()
+        match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', all_text, re.DOTALL)
+        if match:
+             return parse_price(match.group(1)), "Success (Regex)", ""
 
-                # Strip HTML tags to get pure text
-                clean_text = re.sub('<[^<]+?>', ' ', content)
-                clean_text = re.sub(r'\s+', ' ', clean_text) # Collapse spaces
-
-                # REGEX: Look for "Average Yearly Rental AED 150,000"
-                match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', clean_text, re.IGNORECASE)
-                
-                if match:
-                    raw_num = match.group(1)
-                    val = parse_clean_number(raw_num)
-                    return val, clean_text, None
-                
-                return 0, clean_text, "Regex did not find 'Average Yearly Rental ... AED ... Number'"
-
-            except Exception as e:
-                browser.close()
-                return 0, str(e), str(e)
+        return 0, "Page loaded, but could not parse rent.", all_text[:500]
 
     except Exception as e:
-        return 0, str(e), str(e)
+        return 0, str(e), ""
 
 # --- EXECUTION ---
 if calc_button:
@@ -106,16 +97,16 @@ if calc_button:
     target_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
     st.session_state['final_url'] = target_url
     
-    with st.status("🔍 Checking Google Cache...", expanded=True) as status:
-        rent, raw_text, error = scrape_data(target_url)
+    with st.status("🔍 Solving Cloudflare Challenge...", expanded=True) as status:
+        rent, msg, debug = fetch_bayut_cloudscraper(target_url)
         st.session_state['scraped_rent'] = rent
-        st.session_state['debug_text'] = raw_text 
+        st.session_state['debug_info'] = debug
         st.session_state['data_fetched'] = True
         
         if rent > 0:
             status.update(label="Data Found!", state="complete", expanded=False)
         else:
-            status.update(label=f"Failed: {error}", state="error", expanded=True)
+            status.update(label=f"Failed: {msg}", state="error", expanded=True)
 
 # --- RESULTS ---
 if st.session_state['data_fetched']:
@@ -128,8 +119,8 @@ if st.session_state['data_fetched']:
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
         else:
             st.warning("⚠️ Enter Manually")
-            with st.expander("🔍 View Scraped Text"):
-                st.text(st.session_state['debug_text'][:2000])
+            with st.expander("Debug Info"):
+                st.text(st.session_state['debug_info'])
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
