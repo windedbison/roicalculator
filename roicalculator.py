@@ -1,5 +1,5 @@
 import streamlit as st
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 import re
 
@@ -11,11 +11,11 @@ if 'scraped_rent' not in st.session_state:
     st.session_state['scraped_rent'] = 0
 if 'data_fetched' not in st.session_state:
     st.session_state['data_fetched'] = False
-if 'debug_info' not in st.session_state:
-    st.session_state['debug_info'] = ""
+if 'data_source' not in st.session_state:
+    st.session_state['data_source'] = ""
 
 st.title("🏙️ Real Estate ROI Calculator")
-st.markdown("Automated Scraper using **CloudScraper** (Cloudflare Bypass).")
+st.markdown("Automated Market Data via **Google Translate Proxy**.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -41,72 +41,95 @@ with st.sidebar:
     commission_pct = st.number_input("Commission (%)", value=2.0)
     occupancy_rate = st.slider("Occupancy (%)", 50, 100, 90)
 
-# --- SCRAPER LOGIC ---
+# --- HELPER: CLEAN PRICE ---
 def parse_price(text):
-    # Extracts "150,000" from "AED 150,000"
     clean = re.sub(r'[^\d.]', '', text)
     if clean:
         return int(float(clean))
     return 0
 
-def fetch_bayut_cloudscraper(url):
-    # Initialize the solver
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
+# --- METHOD 1: GOOGLE TRANSLATE PROXY ---
+def fetch_via_translate(target_url):
+    # We ask Google Translate to fetch Bayut for us
+    proxy_url = f"https://translate.google.com/translate?sl=auto&tl=en&u={target_url}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
     try:
-        # Request the page
-        response = scraper.get(url)
-        
-        if response.status_code != 200:
-            return 0, f"Blocked: {response.status_code}", response.text[:500]
-            
+        response = requests.get(proxy_url, headers=headers, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 1. Look for 'Average Yearly Rental'
-        target = soup.find(string=re.compile("Average Yearly Rental"))
-        if target:
-            parent = target.find_parent()
-            full_text = parent.get_text() if parent else ""
-            match = re.search(r'AED\s*([\d,]+)', full_text)
-            if match:
-                return parse_price(match.group(1)), "Success (Bayut Direct)", ""
-
-        # 2. Fallback: Search all text
+        # Google wraps the content in iframes or weird tags, so we search raw text
         all_text = soup.get_text()
-        match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', all_text, re.DOTALL)
+        
+        # Regex for "Average Yearly Rental ... AED 150,000"
+        # The proxy often adds spaces, so we are flexible
+        match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', all_text, re.IGNORECASE | re.DOTALL)
+        
         if match:
-             return parse_price(match.group(1)), "Success (Regex)", ""
+            return parse_price(match.group(1)), "Bayut (via Google Translate)"
+            
+        return 0, "Failed"
+    except:
+        return 0, "Failed"
 
-        return 0, "Page loaded, but could not parse rent.", all_text[:500]
-
-    except Exception as e:
-        return 0, str(e), ""
+# --- METHOD 2: PROPSEARCH (FALLBACK) ---
+def fetch_via_propsearch(loc_name, unit_name):
+    slug = loc_name.lower().strip().replace(" ", "-")
+    url = f"https://propsearch.ae/dubai/{slug}"
+    
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find the table row for the unit
+        # PropSearch uses "1 Bed", "2 Bed" etc.
+        search_term = unit_name.replace("Bedroom", "Bed").replace("Studio", "Studio")
+        
+        rows = soup.find_all('tr')
+        for row in rows:
+            text = row.get_text()
+            if search_term in text and "Average" not in text: # Skip header
+                # Look for price in the row
+                prices = re.findall(r'([\d,]{3,})', text)
+                if prices:
+                    # Usually the first number is the average or low end
+                    val = parse_price(prices[0])
+                    if val > 20000:
+                        return val, "PropSearch Aggregation"
+        return 0, "Failed"
+    except:
+        return 0, "Failed"
 
 # --- EXECUTION ---
 if calc_button:
+    # 1. Setup URLs
     loc_slug = location.lower().strip().replace(" ", "-")
     p_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
     bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
+    bayut_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
+    st.session_state['final_url'] = bayut_url
     
-    target_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
-    st.session_state['final_url'] = target_url
-    
-    with st.status("🔍 Solving Cloudflare Challenge...", expanded=True) as status:
-        rent, msg, debug = fetch_bayut_cloudscraper(target_url)
+    with st.status("🔍 Finding Market Data...", expanded=True) as status:
+        # ATTEMPT 1: Google Translate Proxy
+        st.write("Trying Google Translate Proxy...")
+        rent, source = fetch_via_translate(bayut_url)
+        
+        # ATTEMPT 2: PropSearch Fallback
+        if rent == 0:
+            st.write("Google blocked. Switching to Aggregator...")
+            rent, source = fetch_via_propsearch(location, unit_conf)
+        
         st.session_state['scraped_rent'] = rent
-        st.session_state['debug_info'] = debug
+        st.session_state['data_source'] = source
         st.session_state['data_fetched'] = True
         
         if rent > 0:
-            status.update(label="Data Found!", state="complete", expanded=False)
+            status.update(label=f"Data Found! Source: {source}", state="complete", expanded=False)
         else:
-            status.update(label=f"Failed: {msg}", state="error", expanded=True)
+            status.update(label="All sources blocked. Enter manually.", state="error", expanded=True)
 
 # --- RESULTS ---
 if st.session_state['data_fetched']:
@@ -116,11 +139,10 @@ if st.session_state['data_fetched']:
     with c1:
         if st.session_state['scraped_rent'] > 0:
             st.success(f"✅ Market Rent: **AED {st.session_state['scraped_rent']:,.0f}**")
+            st.caption(f"Source: {st.session_state['data_source']}")
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
         else:
-            st.warning("⚠️ Enter Manually")
-            with st.expander("Debug Info"):
-                st.text(st.session_state['debug_info'])
+            st.warning("⚠️ Could not scrape. Enter manually.")
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
