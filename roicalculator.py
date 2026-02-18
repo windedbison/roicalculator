@@ -8,7 +8,7 @@ import streamlit as st
 st.set_page_config(page_title="Real Estate ROI Calculator", layout="wide")
 
 st.title("🏙️ Real Estate ROI Calculator")
-st.markdown("Direct Data Integration: **Dubai Land Department (DLD) Open Data**.")
+st.markdown("Direct Data Integration: **Bayut Transactions API**.")
 
 if "scraped_rent" not in st.session_state:
     st.session_state["scraped_rent"] = 0
@@ -16,13 +16,12 @@ if "data_fetched" not in st.session_state:
     st.session_state["data_fetched"] = False
 if "fetch_debug" not in st.session_state:
     st.session_state["fetch_debug"] = {}
-if "dld_access_token" not in st.session_state:
-    st.session_state["dld_access_token"] = ""
-if "dld_token_expiry_utc" not in st.session_state:
-    st.session_state["dld_token_expiry_utc"] = None
 
-DLD_ENDPOINT = "https://api.dubaipulse.gov.ae/open/dld/dld_transactions-open"
-TOKEN_ENDPOINT = "https://api.dubaipulse.gov.ae/oauth/client_credential/accesstoken"
+BAYUT_BASE_URL = "https://uae-real-estate2.p.rapidapi.com"
+BAYUT_LOCATIONS_ENDPOINT = f"{BAYUT_BASE_URL}/locations_search"
+BAYUT_TRANSACTIONS_ENDPOINT = f"{BAYUT_BASE_URL}/transactions"
+BAYUT_HOST = "uae-real-estate2.p.rapidapi.com"
+BAYUT_API_KEY = "8a50c7f41cmshab66c3d205f1b02p1cc073jsn3d4f714a5a14"
 
 DATE_KEYS = [
     "instance_date",
@@ -71,7 +70,7 @@ with st.sidebar:
     st.header("1. Property Details")
     property_type = st.selectbox("Property Type", ["Apartment", "Villa", "Townhouse"])
     
-    # DLD Area Names are specific. We provide common ones.
+    # Common Dubai communities for lookup.
     top_areas = [
         "Dubai Marina", "Business Bay", "Downtown Dubai", "Jumeirah Village Circle",
         "Palm Jumeirah", "Jumeirah Lake Towers", "Dubai Hills Estate", 
@@ -95,12 +94,9 @@ with st.sidebar:
     commission_pct = st.number_input("Agency Commission (%)", value=2.0)
     occupancy = st.slider("Occupancy Rate (%)", 50, 100, 92)
 
-    st.header("3. DLD API Access")
-    dld_api_key = st.text_input("Dubai Pulse API Key", type="password", key="dld_api_key_input")
-    dld_api_secret = st.text_input("Dubai Pulse API Secret", type="password", key="dld_api_secret_input")
-    st.caption("If left empty, DLD often returns 401 and the calculator uses fallback estimates.")
+    st.caption("Live market rent is pulled from Bayut transactions API.")
 
-# --- DLD API LOGIC ---
+# --- Bayut API LOGIC ---
 def normalize_record(record):
     return {str(key).strip().lower(): value for key, value in record.items()}
 
@@ -211,6 +207,16 @@ def parse_target_bedrooms(unit_type):
         return 0
     match = re.search(r"\d+", text)
     return int(match.group()) if match else None
+
+
+def build_bayut_verify_url(location, property_type, unit_type):
+    loc_slug = location.lower().strip().replace(" ", "-")
+    property_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
+    bed_slug = "studio" if "studio" in unit_type.lower() else f"{unit_type.split()[0]}-bedroom"
+    return (
+        "https://www.bayut.com/property-market-analysis/transactions/rent/"
+        f"{bed_slug}-{property_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
+    )
 
 
 def classify_contract_status(record):
@@ -348,73 +354,115 @@ def extract_annual_rent(record):
     return None
 
 
-def get_dld_token(api_key, api_secret):
-    if not api_key or not api_secret:
-        return None, {"token_source": "none", "token_error": "Missing API key or API secret."}
-
-    now = datetime.now(timezone.utc)
-    cached_token = st.session_state.get("dld_access_token", "")
-    cached_expiry = st.session_state.get("dld_token_expiry_utc")
-    if (
-        cached_token
-        and isinstance(cached_expiry, datetime)
-        and cached_expiry > (now + timedelta(seconds=30))
-    ):
-        return cached_token, {
-            "token_source": "cache",
-            "token_expiry_utc": cached_expiry.isoformat(),
-        }
-
-    try:
-        response = requests.post(
-            TOKEN_ENDPOINT,
-            params={"grant_type": "client_credentials"},
-            data={
-                "client_id": api_key.strip(),
-                "client_secret": api_secret.strip(),
-            },
-            timeout=15,
-            headers={"Accept": "application/json"},
-        )
-        token_meta = {
-            "token_source": "fresh",
-            "token_request_status_code": response.status_code,
-        }
-        response.raise_for_status()
-
-        payload = response.json()
-        access_token = payload.get("access_token")
-        if not access_token:
-            token_meta["token_error"] = "Token response did not contain access_token."
-            return None, token_meta
-
-        expires_in = int(payload.get("expires_in", 1800))
-        expiry = now + timedelta(seconds=max(expires_in - 60, 60))
-        st.session_state["dld_access_token"] = access_token
-        st.session_state["dld_token_expiry_utc"] = expiry
-        token_meta["token_expiry_utc"] = expiry.isoformat()
-        return access_token, token_meta
-    except (requests.RequestException, ValueError) as exc:
-        return None, {
-            "token_source": "fresh",
-            "token_error": f"Token request failed: {exc}",
-        }
+def map_bayut_category(property_type):
+    mapping = {
+        "Apartment": "apartments",
+        "Villa": "villas",
+        "Townhouse": "townhouses",
+    }
+    return mapping.get(property_type, "apartments")
 
 
-def get_dld_rent(area_name, unit_type, api_key="", api_secret=""):
+def parse_bed_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        bed_count = int(value)
+        return bed_count if 0 <= bed_count <= 10 else None
+
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "studio" in text:
+        return 0
+    match = re.search(r"\d+", text)
+    return int(match.group()) if match else None
+
+
+def extract_location_ids(payload, area_name):
+    candidates = []
+    rows = extract_records(payload)
+    if not rows and isinstance(payload, dict):
+        for key in ("hits", "locations"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows = [item for item in value if isinstance(item, dict)]
+                break
+
+    area_name_lower = area_name.strip().lower()
+    for row in rows:
+        location_id = row.get("id") or row.get("location_id") or row.get("externalID")
+        if location_id is None:
+            continue
+
+        name = str(row.get("name", "")).strip()
+        full_name = str(row.get("full_name", "")).strip()
+        city = str(row.get("city_name", "")).strip()
+        combined = f"{name} {full_name} {city}".lower()
+        score = 0
+        if area_name_lower in combined:
+            score += 2
+        if "dubai" in combined:
+            score += 1
+        candidates.append((score, str(location_id), name or full_name or str(location_id)))
+
+    if not candidates:
+        return [], rows
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = []
+    seen = set()
+    for _, location_id, _ in candidates:
+        if location_id in seen:
+            continue
+        selected.append(location_id)
+        seen.add(location_id)
+        if len(selected) >= 5:
+            break
+    return selected, rows
+
+
+def extract_annual_rent_from_transaction(txn):
+    if not isinstance(txn, dict):
+        return None
+
+    contract = txn.get("contract")
+    if not isinstance(contract, dict):
+        contract = {}
+
+    monthly_amount = parse_amount(contract.get("monthly_amount"))
+    duration_months = parse_amount(contract.get("duration_months"))
+    total_amount = parse_amount(txn.get("amount"))
+
+    if monthly_amount:
+        return monthly_amount * 12
+
+    if total_amount and duration_months and duration_months > 0:
+        return total_amount * (12.0 / duration_months)
+
+    if total_amount:
+        return total_amount
+
+    return None
+
+
+def get_bayut_rent(area_name, property_type, unit_type, api_key=""):
     now = datetime.now(timezone.utc)
     six_month_window_start = now - timedelta(days=183)
     target_bedrooms = parse_target_bedrooms(unit_type)
 
     debug = {
-        "source": "dld_api",
+        "source": "bayut_api",
         "area_name": area_name,
+        "property_type": property_type,
         "unit_type": unit_type,
         "target_bedrooms": target_bedrooms,
         "window_start_utc": six_month_window_start.date().isoformat(),
         "window_end_utc": now.date().isoformat(),
+        "location_rows_received": 0,
+        "location_ids_used": [],
+        "pages_fetched": 0,
         "records_received": 0,
-        "records_rent_procedure": 0,
         "records_new_contract": 0,
         "records_in_last_6_months": 0,
         "records_unit_match": 0,
@@ -435,42 +483,36 @@ def get_dld_rent(area_name, unit_type, api_key="", api_secret=""):
         "Dubai Hills Estate": {"Studio": 82000, "1 Bedroom": 118000, "2 Bedroom": 185000, "3 Bedroom": 295000},
     }
 
-    params = {
-        "area_name_en": area_name,
-        "instance_format": "json",
-        "procedure_name_en": "Rent",
-        "contract_renewal_status": "New",
-        "sort_order": "desc",
-        "limit": 5000,
+    if not api_key:
+        debug["source"] = "fallback_index"
+        debug["fallback_reason"] = "Missing Bayut RapidAPI key."
+        fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
+        debug["fallback_rent_aed"] = fallback_rent
+        debug["fallback_note"] = "Fallback only. Add a valid Bayut key for live results."
+        return fallback_rent, debug
+
+    headers = {
+        "Accept": "application/json",
+        "X-RapidAPI-Key": api_key.strip(),
+        "X-RapidAPI-Host": BAYUT_HOST,
     }
-
-    access_token, token_meta = get_dld_token(api_key, api_secret)
-    debug.update(token_meta)
-
-    headers = {"Accept": "application/json"}
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
+    category = map_bayut_category(property_type)
+    debug["category"] = category
 
     try:
-        response = requests.get(
-            DLD_ENDPOINT,
-            params=params,
+        location_response = requests.get(
+            BAYUT_LOCATIONS_ENDPOINT,
+            params={"query": area_name, "page": 0, "hitsPerPage": 25, "lang": "en"},
             timeout=15,
             headers=headers,
         )
-        debug["api_status_code"] = response.status_code
-        if response.status_code == 401:
+        debug["api_status_code"] = location_response.status_code
+        debug["locations_status_code"] = location_response.status_code
+        if location_response.status_code == 401:
             debug["source"] = "fallback_index"
-            if access_token:
-                debug["fallback_reason"] = (
-                    "DLD returned 401 Unauthorized even with bearer token. "
-                    "Confirm your key/secret are approved for this dataset."
-                )
-            else:
-                debug["fallback_reason"] = (
-                    "DLD returned 401 Unauthorized. Add Dubai Pulse API key + secret "
-                    "to fetch live records."
-                )
+            debug["fallback_reason"] = (
+                "Bayut API returned 401 Unauthorized. Check your RapidAPI key and plan access."
+            )
             fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
             debug["fallback_rent_aed"] = fallback_rent
             debug["fallback_note"] = (
@@ -479,55 +521,111 @@ def get_dld_rent(area_name, unit_type, api_key="", api_secret=""):
             )
             return fallback_rent, debug
 
-        response.raise_for_status()
-
-        payload = response.json()
-        records = extract_records(payload)
-        debug["records_received"] = len(records)
+        location_response.raise_for_status()
+        location_payload = location_response.json()
+        location_ids, location_rows = extract_location_ids(location_payload, area_name)
+        debug["location_rows_received"] = len(location_rows)
+        debug["location_ids_used"] = location_ids
+        if not location_ids:
+            debug["source"] = "fallback_index"
+            debug["fallback_reason"] = "Bayut locations search returned no matching location id."
+            fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
+            debug["fallback_rent_aed"] = fallback_rent
+            debug["fallback_note"] = "Fallback only. No Bayut location id available for this area."
+            return fallback_rent, debug
 
         rents = []
-        for raw_record in records:
-            if not isinstance(raw_record, dict):
-                continue
-            record = normalize_record(raw_record)
+        for page in range(3):
+            payload = {
+                "purpose": "for-rent",
+                "category": category,
+                "locations_ids": location_ids,
+                "contract_type": "New",
+                "sort_by": "date",
+                "order": "desc",
+                "start_date": six_month_window_start.date().isoformat(),
+                "end_date": now.date().isoformat(),
+                "time_frame": "6m",
+                "page": page,
+            }
+            if target_bedrooms is not None:
+                payload["beds"] = [target_bedrooms]
 
-            if not is_rental_record(record):
-                continue
-            debug["records_rent_procedure"] += 1
+            response = requests.post(
+                BAYUT_TRANSACTIONS_ENDPOINT,
+                json=payload,
+                timeout=20,
+                headers=headers,
+            )
+            debug["api_status_code"] = response.status_code
+            if response.status_code == 401:
+                debug["source"] = "fallback_index"
+                debug["fallback_reason"] = (
+                    "Bayut transactions endpoint returned 401. Confirm API key access to /transactions."
+                )
+                fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
+                debug["fallback_rent_aed"] = fallback_rent
+                debug["fallback_note"] = "Fallback only. Bayut transactions request unauthorized."
+                return fallback_rent, debug
 
-            contract_status = classify_contract_status(record)
-            if contract_status == "renewal":
-                debug["records_not_new"] += 1
-                continue
-            if contract_status == "unknown":
-                debug["records_status_unknown"] += 1
-            else:
-                debug["records_new_contract"] += 1
+            response.raise_for_status()
+            debug["pages_fetched"] += 1
 
-            transaction_date = extract_record_date(record)
-            if not transaction_date:
-                debug["records_missing_date"] += 1
-                continue
-            if transaction_date < six_month_window_start or transaction_date > now + timedelta(days=1):
-                debug["records_outside_6m"] += 1
-                continue
-            debug["records_in_last_6_months"] += 1
+            page_payload = response.json()
+            records = extract_records(page_payload)
+            if not records and isinstance(page_payload, dict):
+                page_records = page_payload.get("transactions")
+                if isinstance(page_records, list):
+                    records = [item for item in page_records if isinstance(item, dict)]
 
-            unit_match, has_unit_info = record_matches_target_unit(record, target_bedrooms)
-            if not has_unit_info:
-                debug["records_missing_unit_info"] += 1
-                continue
-            if not unit_match:
-                continue
-            debug["records_unit_match"] += 1
+            debug["records_received"] += len(records)
 
-            rent_amount = extract_annual_rent(record)
-            if rent_amount is None:
-                debug["records_missing_rent_amount"] += 1
-                continue
+            for txn in records:
+                contract = txn.get("contract")
+                if not isinstance(contract, dict):
+                    contract = {}
 
-            debug["records_used"] += 1
-            rents.append(rent_amount)
+                contract_type = str(contract.get("contract_type", "")).strip().lower()
+                if contract_type:
+                    if "renew" in contract_type:
+                        debug["records_not_new"] += 1
+                        continue
+                    if "new" in contract_type:
+                        debug["records_new_contract"] += 1
+                    else:
+                        debug["records_status_unknown"] += 1
+
+                transaction_date = parse_datetime(txn.get("date"))
+                if not transaction_date:
+                    debug["records_missing_date"] += 1
+                    continue
+                if transaction_date < six_month_window_start or transaction_date > now + timedelta(days=1):
+                    debug["records_outside_6m"] += 1
+                    continue
+                debug["records_in_last_6_months"] += 1
+
+                property_info = txn.get("property")
+                if not isinstance(property_info, dict):
+                    property_info = {}
+                bed_count = parse_bed_value(property_info.get("beds"))
+                if target_bedrooms is not None:
+                    if bed_count is None:
+                        debug["records_missing_unit_info"] += 1
+                        continue
+                    if bed_count != target_bedrooms:
+                        continue
+                debug["records_unit_match"] += 1
+
+                rent_amount = extract_annual_rent_from_transaction(txn)
+                if rent_amount is None or not (10_000 <= rent_amount <= 5_000_000):
+                    debug["records_missing_rent_amount"] += 1
+                    continue
+
+                debug["records_used"] += 1
+                rents.append(rent_amount)
+
+            if len(records) < 20:
+                break
 
         if rents:
             rents_sorted = sorted(rents)
@@ -546,51 +644,50 @@ def get_dld_rent(area_name, unit_type, api_key="", api_secret=""):
             return avg_rent, debug
 
         debug["source"] = "fallback_index"
-        debug["fallback_reason"] = "No DLD records matched all filters."
+        debug["fallback_reason"] = "No Bayut transactions matched filters."
     except requests.RequestException as exc:
         debug["source"] = "fallback_index"
-        debug["fallback_reason"] = f"API request failed: {exc}"
+        debug["fallback_reason"] = f"Bayut API request failed: {exc}"
     except ValueError as exc:
         debug["source"] = "fallback_index"
-        debug["fallback_reason"] = f"Unable to parse API payload: {exc}"
+        debug["fallback_reason"] = f"Unable to parse Bayut API payload: {exc}"
 
     fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
     debug["fallback_rent_aed"] = fallback_rent
     debug["fallback_note"] = (
-        "Fallback is reference only and is not guaranteed to be strictly new-contract "
-        "transactions from the last 6 months."
+        "Fallback is reference only and is not guaranteed to match live Bayut transactions."
     )
     return fallback_rent, debug
 
 # --- EXECUTION ---
 if calc_button:
-    with st.status("🔗 Connecting to Dubai Land Department...", expanded=True) as status:
-        rent, fetch_debug = get_dld_rent(location, unit_conf, dld_api_key, dld_api_secret)
+    with st.status("🔗 Connecting to Bayut API...", expanded=True) as status:
+        rent, fetch_debug = get_bayut_rent(location, property_type, unit_conf, BAYUT_API_KEY)
         st.session_state["scraped_rent"] = rent
         st.session_state["fetch_debug"] = fetch_debug
         st.session_state["data_fetched"] = True
 
-        if rent > 0 and fetch_debug.get("source") == "dld_api":
+        if rent > 0 and fetch_debug.get("source") == "bayut_api":
             status.update(
-                label="DLD Data Verified (new contracts, last 6 months).",
+                label="Bayut transactions loaded (new contracts, last 6 months).",
                 state="complete",
                 expanded=False,
             )
         elif rent > 0 and fetch_debug.get("api_status_code") == 401:
             status.update(
-                label="DLD API authorization required. Using fallback estimate.",
+                label="Bayut API authorization required. Using fallback estimate.",
                 state="error",
                 expanded=True,
             )
         elif rent > 0:
             status.update(
-                label="DLD API strict filter unavailable. Fallback index value loaded.",
+                label="Bayut API filter unavailable. Fallback index value loaded.",
                 state="complete",
                 expanded=True,
             )
         else:
             status.update(
-                label="No qualified DLD transactions found. Enter rent manually.",
+                label="No qualified Bayut transactions found. Enter rent manually.",
                 state="error",
                 expanded=True,
             )
@@ -604,26 +701,27 @@ if st.session_state.get("data_fetched"):
     col_res, col_verify = st.columns([2, 1])
     with col_res:
         if st.session_state["scraped_rent"] > 0:
-            if source == "dld_api":
-                st.success(f"📍 DLD 6-Month New-Contract Average: **AED {st.session_state['scraped_rent']:,.0f}**")
+            if source == "bayut_api":
+                st.success(f"📍 Bayut 6-Month New-Contract Average: **AED {st.session_state['scraped_rent']:,.0f}**")
             else:
                 st.warning(f"⚠️ Fallback Index Estimate: **AED {st.session_state['scraped_rent']:,.0f}**")
             final_rent = st.number_input("Annual Rent (AED)", value=float(st.session_state["scraped_rent"]))
         else:
-            st.warning("⚠️ No DLD rows matched the strict filter. Enter annual rent manually.")
+            st.warning("⚠️ No Bayut rows matched the strict filter. Enter annual rent manually.")
             final_rent = st.number_input("Annual Rent (AED)", value=0.0)
 
-        if source == "dld_api":
-            st.caption("Filters used: Rent procedure + New contracts + last 6 months + selected unit type.")
+        if source == "bayut_api":
+            st.caption("Filters used: purpose=for-rent + contract_type=New + last 6 months + selected unit type.")
         else:
             st.caption("Source: fallback estimate. It may include mixed contract types and date ranges.")
             if fetch_debug.get("api_status_code") == 401:
-                st.info("Live DLD access is unauthorized. Add or verify Dubai Pulse API key/secret in the sidebar.")
+                st.info("Live Bayut access is unauthorized. Add or verify your RapidAPI key in the sidebar.")
 
     with col_verify:
-        st.markdown(f"<br><a href='https://dubailand.gov.ae/en/eservices/rental-index/rental-index/' target='_blank'>Official RERA Index ↗</a>", unsafe_allow_html=True)
+        verify_url = build_bayut_verify_url(location, property_type, unit_conf)
+        st.markdown(f"<br><a href='{verify_url}' target='_blank'>Verify on Bayut ↗</a>", unsafe_allow_html=True)
 
-    with st.expander("Debug: DLD transaction filter summary"):
+    with st.expander("Debug: Bayut transaction filter summary"):
         st.json(fetch_debug)
 
     if final_rent > 0:
