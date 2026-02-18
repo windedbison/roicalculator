@@ -5,6 +5,7 @@ import time
 from playwright.sync_api import sync_playwright
 
 # --- 1. FORCE INSTALL ---
+# Essential for Streamlit Cloud to have the browser engine
 try:
     os.system("playwright install chromium")
 except:
@@ -13,7 +14,7 @@ except:
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Dubai ROI Calculator", layout="wide")
 
-# --- SESSION STATE ---
+# --- SESSION STATE INITIALIZATION ---
 if 'scraped_rent' not in st.session_state:
     st.session_state['scraped_rent'] = 0
 if 'data_fetched' not in st.session_state:
@@ -47,8 +48,13 @@ with st.sidebar:
     
     st.header("3. Operational")
     occupancy_rate = st.slider("Occupancy Rate (%)", 50, 100, 85, 5)
+    
+    st.divider()
+    
+    # --- MOVED BUTTON HERE FOR VISIBILITY ---
+    calc_button = st.button("Calculate ROI", type="primary", use_container_width=True)
 
-# --- SCRAPER LOGIC ---
+# --- HELPER FUNCTIONS ---
 def parse_abbreviated_number(text):
     clean = text.upper().replace(',', '').replace('AED', '').strip()
     multiplier = 1
@@ -64,4 +70,112 @@ def parse_abbreviated_number(text):
     return None
 
 def scrape_data(url):
-    screenshot
+    try:
+        with sync_playwright() as p:
+            # Force Desktop Viewport (1920x1080) to ensure text is visible
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            
+            # Navigate with long timeout
+            page.goto(url, timeout=60000)
+            
+            try:
+                # Wait for Anchor Text
+                label_locator = page.get_by_text("Average Yearly Rental", exact=False).first
+                label_locator.wait_for(timeout=25000)
+                
+                # Grab Text Block
+                container = label_locator.locator("..").locator("..") 
+                text_block = container.inner_text()
+                
+                browser.close()
+                
+                # Parse Logic
+                lines = text_block.split('\n')
+                possible_values = []
+                for line in lines:
+                    if "Average" in line or "Rental" in line or "%" in line or not line.strip():
+                        continue
+                    val = parse_abbreviated_number(line)
+                    if val and val > 10000: 
+                        possible_values.append(val)
+                
+                return (possible_values[0] if possible_values else 0), None
+                
+            except Exception as e:
+                # Capture Screenshot on Failure
+                screenshot_bytes = page.screenshot(full_page=False)
+                browser.close()
+                return 0, screenshot_bytes
+
+    except Exception as e:
+        return 0, None
+
+# --- MAIN LOGIC ---
+if calc_button:
+    # 1. Build URL
+    loc_slug = location.lower().strip().replace(" ", "-")
+    p_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
+    bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
+    
+    target_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
+    st.session_state['final_url'] = target_url
+    st.session_state['debug_screenshot'] = None # Reset previous errors
+    
+    # 2. Run Scraper
+    with st.status("🔍 Syncing with Bayut (Desktop Mode)...", expanded=True) as status:
+        rent, screenshot = scrape_data(target_url)
+        st.session_state['scraped_rent'] = rent
+        st.session_state['debug_screenshot'] = screenshot
+        
+        if rent > 0:
+            st.session_state['data_fetched'] = True
+            status.update(label="Data Found!", state="complete", expanded=False)
+        else:
+            st.session_state['data_fetched'] = True
+            status.update(label="Auto-scrape failed.", state="error", expanded=True)
+
+# --- RESULTS DISPLAY ---
+if st.session_state['data_fetched']:
+    st.divider()
+    
+    col_input, col_link = st.columns([3, 1])
+    with col_input:
+        if st.session_state['scraped_rent'] > 0:
+            st.success(f"✅ Market Rent Found: **AED {st.session_state['scraped_rent']:,.0f}**")
+            final_rent = st.number_input("Annual Rent (AED)", value=float(st.session_state['scraped_rent']))
+        else:
+            st.warning("⚠️ Auto-scrape failed. Enter manually.")
+            
+            # DEBUGGER: Show screenshot if available
+            if st.session_state['debug_screenshot']:
+                with st.expander("📸 See what the bot saw (Debug)"):
+                    st.image(st.session_state['debug_screenshot'], caption="Bot View")
+                    st.caption("If you see a CAPTCHA or 'Access Denied', Bayut is blocking cloud IPs.")
+            
+            final_rent = st.number_input("Manual Rent (AED)", value=0.0)
+            
+    with col_link:
+        st.markdown(f"<br><a href='{st.session_state['final_url']}' target='_blank'>Verify on Bayut ↗</a>", unsafe_allow_html=True)
+            
+    if final_rent > 0:
+        total_cost = unit_price + (unit_price * 0.04) + (unit_price * (commission_pct/100)) + 4580
+        net = (final_rent * (occupancy_rate/100)) - (unit_size * service_charge_per_sqft)
+        roi = (net / total_cost) * 100
+        
+        # Emoji Logic
+        emoji = "🔴"
+        if roi >= 8.0: emoji = "🟢"
+        elif roi >= 6.0: emoji = "🟢"
+        elif roi >= 4.0: emoji = "🟡"
+        
+        st.divider()
+        st.subheader(f"📊 ROI Analysis for {unit_conf} in {location}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Investment", f"{total_cost:,.0f} AED")
+        c2.metric("Net Income", f"{net:,.0f} AED")
+        c3.metric("NET ROI", f"{emoji} {roi:.2f}%")
