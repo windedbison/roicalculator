@@ -10,7 +10,6 @@ except:
     pass
 
 # --- PAGE CONFIGURATION ---
-# FIXED: Removed "Rabdan" branding
 st.set_page_config(page_title="Real Estate ROI Calculator", layout="wide")
 
 # --- SESSION STATE ---
@@ -18,12 +17,9 @@ if 'scraped_rent' not in st.session_state:
     st.session_state['scraped_rent'] = 0
 if 'data_fetched' not in st.session_state:
     st.session_state['data_fetched'] = False
-if 'final_url' not in st.session_state:
-    st.session_state['final_url'] = ""
-if 'debug_screenshot' not in st.session_state:
-    st.session_state['debug_screenshot'] = None
+if 'debug_text' not in st.session_state:
+    st.session_state['debug_text'] = ""
 
-# FIXED: Main Header
 st.title("🏙️ Real Estate ROI Calculator")
 st.markdown("Automated Scraper using **Google Cache Bypass**.")
 
@@ -52,74 +48,53 @@ with st.sidebar:
     occupancy_rate = st.slider("Occupancy (%)", 50, 100, 90)
 
 # --- SCRAPER LOGIC ---
-def parse_abbreviated_number(text):
-    # Cleans "150,000", "150k", "1.5M"
-    clean = text.upper().replace(',', '').replace('AED', '').strip()
-    multiplier = 1
-    if 'M' in clean:
-        multiplier = 1000000
-        clean = clean.replace('M', '')
-    elif 'K' in clean:
-        multiplier = 1000
-        clean = clean.replace('K', '')
-    match = re.search(r'([\d\.]+)', clean)
-    if match:
-        return int(float(match.group(1)) * multiplier)
-    return None
+def parse_clean_number(text):
+    # Turns "150,000", "150, 000" into 150000
+    clean = re.sub(r'[^\d.]', '', text)
+    if clean:
+        return int(float(clean))
+    return 0
 
 def scrape_data(bayut_url):
-    # Google Cache Text-Only URL
+    # Use text-only cache (&strip=1)
     cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{bayut_url}&strip=1&vwsrc=0"
     
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"]
-            )
-            
-            # FIXED: Syntax error for referer is corrected here
+            browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                extra_http_headers={"Referer": "https://www.google.com/"}
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = context.new_page()
-            
-            # Go to Google Cache
             page.goto(cache_url, timeout=45000)
             
             try:
-                # Grab content
-                content = page.content()
-                
-                # Check for 404 (Not Cached)
-                if "404. That’s an error" in content:
-                    browser.close()
-                    return 0, None, "Page not found in Google Cache."
-
+                # Get the full text content of the page
+                full_text = page.inner_text()
                 browser.close()
-                
-                # CLEAN TEXT: Remove HTML tags to search pure text
-                text_only = re.sub('<[^<]+?>', ' ', content)
-                
-                # REGEX HUNT
-                match = re.search(r'Average Yearly Rental.{0,60}?(\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:[kKmM])?)', text_only, re.IGNORECASE)
+
+                if "404." in full_text and "That’s an error" in full_text:
+                    return 0, full_text, "Page not found in Google Cache."
+
+                # --- NEW REGEX LOGIC ---
+                # Look specifically for: Average Yearly Rental [spaces] AED [spaces] NUMBER
+                # Matches: "Average Yearly Rental AED 145,000"
+                # Matches: "Average Yearly Rental (AED) 145,000"
+                match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', full_text, re.IGNORECASE | re.DOTALL)
                 
                 if match:
                     raw_num = match.group(1)
-                    val = parse_abbreviated_number(raw_num)
-                    return val, None, None
+                    val = parse_clean_number(raw_num)
+                    return val, full_text, None
                 
-                return 0, None, "Found cache, but regex missed the number."
-                
+                return 0, full_text, "Regex did not find 'Average Yearly Rental ... AED ... Number'"
+
             except Exception as e:
-                screenshot = page.screenshot(full_page=False)
                 browser.close()
-                return 0, screenshot, str(e)
+                return 0, str(e), str(e)
 
     except Exception as e:
-        return 0, None, str(e)
+        return 0, str(e), str(e)
 
 # --- EXECUTION ---
 if calc_button:
@@ -127,21 +102,19 @@ if calc_button:
     p_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
     bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
     
-    # Construct Original Bayut URL
     target_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
     st.session_state['final_url'] = target_url
-    st.session_state['debug_screenshot'] = None
     
     with st.status("🔍 Checking Google Cache...", expanded=True) as status:
-        rent, screenshot, error = scrape_data(target_url)
+        rent, raw_text, error = scrape_data(target_url)
         st.session_state['scraped_rent'] = rent
-        st.session_state['debug_screenshot'] = screenshot
+        st.session_state['debug_text'] = raw_text # Save for debugging
         st.session_state['data_fetched'] = True
         
         if rent > 0:
-            status.update(label="Data Found (via Cache)!", state="complete", expanded=False)
+            status.update(label="Data Found!", state="complete", expanded=False)
         else:
-            status.update(label=f"Cache Lookup Failed: {error}", state="error", expanded=True)
+            status.update(label=f"Failed: {error}", state="error", expanded=True)
 
 # --- RESULTS ---
 if st.session_state['data_fetched']:
@@ -152,12 +125,11 @@ if st.session_state['data_fetched']:
         if st.session_state['scraped_rent'] > 0:
             st.success(f"✅ Market Rent: **AED {st.session_state['scraped_rent']:,.0f}**")
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
-            st.caption("Source: Google Cache of Bayut")
         else:
             st.warning("⚠️ Enter Manually")
-            if st.session_state['debug_screenshot']:
-                with st.expander("📸 Debug View"):
-                    st.image(st.session_state['debug_screenshot'], caption="Bot View")
+            # DEBUGGER: Show the text we found so we can fix the regex if needed
+            with st.expander("🔍 View Scraped Text (Why did it fail?)"):
+                st.text(st.session_state['debug_text'][:2000]) # Show first 2000 chars
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
