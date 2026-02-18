@@ -1,7 +1,6 @@
 import streamlit as st
 import re
 import os
-import time
 from playwright.sync_api import sync_playwright
 
 # --- 1. FORCE INSTALL ---
@@ -11,7 +10,8 @@ except:
     pass
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="ROI Calculator", layout="wide")
+# FIXED: Removed "Rabdan" branding
+st.set_page_config(page_title="Real Estate ROI Calculator", layout="wide")
 
 # --- SESSION STATE ---
 if 'scraped_rent' not in st.session_state:
@@ -23,8 +23,9 @@ if 'final_url' not in st.session_state:
 if 'debug_screenshot' not in st.session_state:
     st.session_state['debug_screenshot'] = None
 
-st.title("🏙️ Dubai Real Estate ROI Calculator")
-st.markdown("Automated Scraper using **Google Cache Bypass** (Evades Cloudflare).")
+# FIXED: Main Header
+st.title("🏙️ Real Estate ROI Calculator")
+st.markdown("Automated Scraper using **Google Cache Bypass**.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -52,6 +53,7 @@ with st.sidebar:
 
 # --- SCRAPER LOGIC ---
 def parse_abbreviated_number(text):
+    # Cleans "150,000", "150k", "1.5M"
     clean = text.upper().replace(',', '').replace('AED', '').strip()
     multiplier = 1
     if 'M' in clean:
@@ -66,8 +68,7 @@ def parse_abbreviated_number(text):
     return None
 
 def scrape_data(bayut_url):
-    # THE HACK: Ask Google Cache for the page instead of Bayut
-    # We add '&strip=1' to get the text-only version (faster, no ads/scripts)
+    # Google Cache Text-Only URL
     cache_url = f"http://webcache.googleusercontent.com/search?q=cache:{bayut_url}&strip=1&vwsrc=0"
     
     try:
@@ -77,11 +78,11 @@ def scrape_data(bayut_url):
                 args=["--disable-blink-features=AutomationControlled"]
             )
             
-            # Pretend to be a Google User
+            # FIXED: Syntax error for referer is corrected here
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                referer="https://www.google.com/"
+                extra_http_headers={"Referer": "https://www.google.com/"}
             )
             page = context.new_page()
             
@@ -89,37 +90,28 @@ def scrape_data(bayut_url):
             page.goto(cache_url, timeout=45000)
             
             try:
-                # In Google Cache, the original page content is usually inside a specific block
-                # We search the whole body for the pattern because selectors might break in cache view
+                # Grab content
                 content = page.content()
                 
-                # Check if we actually got the cache or a Google Error
+                # Check for 404 (Not Cached)
                 if "404. That’s an error" in content:
                     browser.close()
-                    return 0, None, "Google hasn't cached this specific page yet."
+                    return 0, None, "Page not found in Google Cache."
 
-                # EXTRACT LOGIC (Regex Scan because structure is messy in cache)
-                # We look for "Average Yearly Rental" followed loosely by a price
-                # Or we look for the specific table structure text
-                
                 browser.close()
                 
-                # Clean HTML tags to just get text
+                # CLEAN TEXT: Remove HTML tags to search pure text
                 text_only = re.sub('<[^<]+?>', ' ', content)
                 
-                # Find the magic number
-                # Bayut format: "Average Yearly Rental (AED) 150,000"
-                # We look for "Average Yearly Rental" and grab the next 50 chars
-                match = re.search(r'Average Yearly Rental.*?(\d{2,}[,\d]*\s*[kKmM]?)', text_only, re.IGNORECASE)
+                # REGEX HUNT
+                match = re.search(r'Average Yearly Rental.{0,60}?(\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:[kKmM])?)', text_only, re.IGNORECASE)
                 
                 if match:
                     raw_num = match.group(1)
                     val = parse_abbreviated_number(raw_num)
                     return val, None, None
                 
-                # Fallback: Look for large numbers near "AED"
-                # This is risky but works for "text-only" cache
-                return 0, None, "Could not identify number in cached text."
+                return 0, None, "Found cache, but regex missed the number."
                 
             except Exception as e:
                 screenshot = page.screenshot(full_page=False)
@@ -135,12 +127,12 @@ if calc_button:
     p_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
     bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
     
-    # Original URL
+    # Construct Original Bayut URL
     target_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
     st.session_state['final_url'] = target_url
     st.session_state['debug_screenshot'] = None
     
-    with st.status("🔍 Checking Google Cache for Data...", expanded=True) as status:
+    with st.status("🔍 Checking Google Cache...", expanded=True) as status:
         rent, screenshot, error = scrape_data(target_url)
         st.session_state['scraped_rent'] = rent
         st.session_state['debug_screenshot'] = screenshot
@@ -149,7 +141,7 @@ if calc_button:
         if rent > 0:
             status.update(label="Data Found (via Cache)!", state="complete", expanded=False)
         else:
-            status.update(label=f"Cache Lookup Failed: {error or 'Unknown'}", state="error", expanded=True)
+            status.update(label=f"Cache Lookup Failed: {error}", state="error", expanded=True)
 
 # --- RESULTS ---
 if st.session_state['data_fetched']:
@@ -160,6 +152,7 @@ if st.session_state['data_fetched']:
         if st.session_state['scraped_rent'] > 0:
             st.success(f"✅ Market Rent: **AED {st.session_state['scraped_rent']:,.0f}**")
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
+            st.caption("Source: Google Cache of Bayut")
         else:
             st.warning("⚠️ Enter Manually")
             if st.session_state['debug_screenshot']:
