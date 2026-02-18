@@ -1,10 +1,7 @@
 import streamlit as st
 import re
 import os
-import time
 from playwright.sync_api import sync_playwright
-# NEW: Import the stealth masker
-from playwright_stealth import stealth_sync
 
 # --- 1. FORCE INSTALL ---
 try:
@@ -26,7 +23,7 @@ if 'debug_screenshot' not in st.session_state:
     st.session_state['debug_screenshot'] = None
 
 st.title("🏙️ Dubai Real Estate ROI Calculator")
-st.markdown("Automated Bayut Scraper with **Stealth Mode**.")
+st.markdown("Automated Bayut Scraper with **Manual Stealth Injection**.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -44,13 +41,37 @@ with st.sidebar:
     st.divider()
     calc_button = st.button("Calculate ROI", type="primary", use_container_width=True)
 
-    # Financials (Hidden unless needed for calc)
+    # Financials
     st.header("Financials")
     unit_price = st.number_input("Purchase Price (AED)", min_value=100000, value=1500000, step=50000)
     unit_size = st.number_input("Unit Size (Sq. Ft)", min_value=100, value=800, step=50)
     service_charge_per_sqft = st.number_input("Service Charge (AED/sq.ft)", value=15.0)
     commission_pct = st.number_input("Commission (%)", value=2.0)
     occupancy_rate = st.slider("Occupancy (%)", 50, 100, 90)
+
+# --- MANUAL STEALTH FUNCTION ---
+def apply_stealth(page):
+    """
+    Manually hides automation flags so Bayut thinks we are human.
+    """
+    # 1. Mask the WebDriver property (The biggest red flag)
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+    # 2. Mock Languages (Robots often have empty languages)
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+    """)
+    # 3. Mock Plugins (Robots have 0 plugins)
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+    """)
 
 # --- SCRAPER LOGIC ---
 def parse_abbreviated_number(text):
@@ -70,7 +91,7 @@ def parse_abbreviated_number(text):
 def scrape_data(url):
     try:
         with sync_playwright() as p:
-            # 1. Launch with specific args to hide the automation bar
+            # Launch with arguments that hide the automation bar
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -80,7 +101,6 @@ def scrape_data(url):
                 ]
             )
             
-            # 2. Create Context with specific user agent and viewport
             context = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
@@ -88,14 +108,14 @@ def scrape_data(url):
             
             page = context.new_page()
             
-            # 3. APPLY STEALTH (The Secret Sauce)
-            stealth_sync(page)
+            # APPLY MANUAL STEALTH
+            apply_stealth(page)
             
-            # 4. Go to Bayut
+            # Go to Bayut
             page.goto(url, timeout=60000)
             
             try:
-                # Wait for the specific text
+                # Wait for Anchor
                 label_locator = page.get_by_text("Average Yearly Rental", exact=False).first
                 label_locator.wait_for(timeout=25000)
                 
@@ -116,7 +136,6 @@ def scrape_data(url):
                 return (possible_values[0] if possible_values else 0), None
                 
             except Exception as e:
-                # Capture failure screenshot
                 screenshot = page.screenshot(full_page=False)
                 browser.close()
                 return 0, screenshot
@@ -134,7 +153,7 @@ if calc_button:
     st.session_state['final_url'] = target_url
     st.session_state['debug_screenshot'] = None
     
-    with st.status("🔍 Infiltrating Bayut (Stealth Mode)...", expanded=True) as status:
+    with st.status("🔍 Infiltrating Bayut (Manual Stealth)...", expanded=True) as status:
         rent, screenshot = scrape_data(target_url)
         st.session_state['scraped_rent'] = rent
         st.session_state['debug_screenshot'] = screenshot
@@ -156,10 +175,9 @@ if st.session_state['data_fetched']:
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
         else:
             st.warning("⚠️ Enter Manually")
-            # DEBUGGER
             if st.session_state['debug_screenshot']:
                 with st.expander("📸 Debug View"):
-                    st.image(st.session_state['debug_screenshot'], caption="What the bot saw")
+                    st.image(st.session_state['debug_screenshot'], caption="Bot View")
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
