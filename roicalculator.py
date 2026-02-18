@@ -16,8 +16,13 @@ if "data_fetched" not in st.session_state:
     st.session_state["data_fetched"] = False
 if "fetch_debug" not in st.session_state:
     st.session_state["fetch_debug"] = {}
+if "dld_access_token" not in st.session_state:
+    st.session_state["dld_access_token"] = ""
+if "dld_token_expiry_utc" not in st.session_state:
+    st.session_state["dld_token_expiry_utc"] = None
 
 DLD_ENDPOINT = "https://api.dubaipulse.gov.ae/open/dld/dld_transactions-open"
+TOKEN_ENDPOINT = "https://api.dubaipulse.gov.ae/oauth/client_credential/accesstoken"
 
 DATE_KEYS = [
     "instance_date",
@@ -89,6 +94,11 @@ with st.sidebar:
     service_charge = st.number_input("Service Charge (AED/sq.ft)", value=16.0)
     commission_pct = st.number_input("Agency Commission (%)", value=2.0)
     occupancy = st.slider("Occupancy Rate (%)", 50, 100, 92)
+
+    st.header("3. DLD API Access")
+    dld_api_key = st.text_input("Dubai Pulse API Key", type="password", key="dld_api_key_input")
+    dld_api_secret = st.text_input("Dubai Pulse API Secret", type="password", key="dld_api_secret_input")
+    st.caption("If left empty, DLD often returns 401 and the calculator uses fallback estimates.")
 
 # --- DLD API LOGIC ---
 def normalize_record(record):
@@ -338,7 +348,60 @@ def extract_annual_rent(record):
     return None
 
 
-def get_dld_rent(area_name, unit_type):
+def get_dld_token(api_key, api_secret):
+    if not api_key or not api_secret:
+        return None, {"token_source": "none", "token_error": "Missing API key or API secret."}
+
+    now = datetime.now(timezone.utc)
+    cached_token = st.session_state.get("dld_access_token", "")
+    cached_expiry = st.session_state.get("dld_token_expiry_utc")
+    if (
+        cached_token
+        and isinstance(cached_expiry, datetime)
+        and cached_expiry > (now + timedelta(seconds=30))
+    ):
+        return cached_token, {
+            "token_source": "cache",
+            "token_expiry_utc": cached_expiry.isoformat(),
+        }
+
+    try:
+        response = requests.post(
+            TOKEN_ENDPOINT,
+            params={"grant_type": "client_credentials"},
+            data={
+                "client_id": api_key.strip(),
+                "client_secret": api_secret.strip(),
+            },
+            timeout=15,
+            headers={"Accept": "application/json"},
+        )
+        token_meta = {
+            "token_source": "fresh",
+            "token_request_status_code": response.status_code,
+        }
+        response.raise_for_status()
+
+        payload = response.json()
+        access_token = payload.get("access_token")
+        if not access_token:
+            token_meta["token_error"] = "Token response did not contain access_token."
+            return None, token_meta
+
+        expires_in = int(payload.get("expires_in", 1800))
+        expiry = now + timedelta(seconds=max(expires_in - 60, 60))
+        st.session_state["dld_access_token"] = access_token
+        st.session_state["dld_token_expiry_utc"] = expiry
+        token_meta["token_expiry_utc"] = expiry.isoformat()
+        return access_token, token_meta
+    except (requests.RequestException, ValueError) as exc:
+        return None, {
+            "token_source": "fresh",
+            "token_error": f"Token request failed: {exc}",
+        }
+
+
+def get_dld_rent(area_name, unit_type, api_key="", api_secret=""):
     now = datetime.now(timezone.utc)
     six_month_window_start = now - timedelta(days=183)
     target_bedrooms = parse_target_bedrooms(unit_type)
@@ -381,14 +444,41 @@ def get_dld_rent(area_name, unit_type):
         "limit": 5000,
     }
 
+    access_token, token_meta = get_dld_token(api_key, api_secret)
+    debug.update(token_meta)
+
+    headers = {"Accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
     try:
         response = requests.get(
             DLD_ENDPOINT,
             params=params,
             timeout=15,
-            headers={"Accept": "application/json"},
+            headers=headers,
         )
         debug["api_status_code"] = response.status_code
+        if response.status_code == 401:
+            debug["source"] = "fallback_index"
+            if access_token:
+                debug["fallback_reason"] = (
+                    "DLD returned 401 Unauthorized even with bearer token. "
+                    "Confirm your key/secret are approved for this dataset."
+                )
+            else:
+                debug["fallback_reason"] = (
+                    "DLD returned 401 Unauthorized. Add Dubai Pulse API key + secret "
+                    "to fetch live records."
+                )
+            fallback_rent = fallback_index.get(area_name, {}).get(unit_type, 0)
+            debug["fallback_rent_aed"] = fallback_rent
+            debug["fallback_note"] = (
+                "Fallback is reference only and is not guaranteed to be strictly new-contract "
+                "transactions from the last 6 months."
+            )
+            return fallback_rent, debug
+
         response.raise_for_status()
 
         payload = response.json()
@@ -475,7 +565,7 @@ def get_dld_rent(area_name, unit_type):
 # --- EXECUTION ---
 if calc_button:
     with st.status("🔗 Connecting to Dubai Land Department...", expanded=True) as status:
-        rent, fetch_debug = get_dld_rent(location, unit_conf)
+        rent, fetch_debug = get_dld_rent(location, unit_conf, dld_api_key, dld_api_secret)
         st.session_state["scraped_rent"] = rent
         st.session_state["fetch_debug"] = fetch_debug
         st.session_state["data_fetched"] = True
@@ -485,6 +575,12 @@ if calc_button:
                 label="DLD Data Verified (new contracts, last 6 months).",
                 state="complete",
                 expanded=False,
+            )
+        elif rent > 0 and fetch_debug.get("api_status_code") == 401:
+            status.update(
+                label="DLD API authorization required. Using fallback estimate.",
+                state="error",
+                expanded=True,
             )
         elif rent > 0:
             status.update(
@@ -521,6 +617,8 @@ if st.session_state.get("data_fetched"):
             st.caption("Filters used: Rent procedure + New contracts + last 6 months + selected unit type.")
         else:
             st.caption("Source: fallback estimate. It may include mixed contract types and date ranges.")
+            if fetch_debug.get("api_status_code") == 401:
+                st.info("Live DLD access is unauthorized. Add or verify Dubai Pulse API key/secret in the sidebar.")
 
     with col_verify:
         st.markdown(f"<br><a href='https://dubailand.gov.ae/en/eservices/rental-index/rental-index/' target='_blank'>Official RERA Index ↗</a>", unsafe_allow_html=True)
