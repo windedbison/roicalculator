@@ -1,4 +1,4 @@
 streamlit
-cloudscraper
+requests
 beautifulsoup4
 pandas
