@@ -84,7 +84,7 @@ def scrape_data(url):
     logs = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
             
