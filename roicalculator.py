@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 import re
 
 # --- PAGE CONFIGURATION ---
@@ -11,17 +12,18 @@ if 'scraped_rent' not in st.session_state:
     st.session_state['scraped_rent'] = 0
 if 'data_fetched' not in st.session_state:
     st.session_state['data_fetched'] = False
-if 'data_source' not in st.session_state:
-    st.session_state['data_source'] = ""
+if 'debug_log' not in st.session_state:
+    st.session_state['debug_log'] = ""
 
 st.title("🏙️ Real Estate ROI Calculator")
-st.markdown("Automated Market Data via **Google Translate Proxy**.")
+st.markdown("Automated Market Data via **PropSearch** & **Smart Search**.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
     st.header("1. Property Details")
     property_type = st.selectbox("Property Type", ["Apartment", "Villa", "Townhouse"])
-    location = st.text_input("Location", value="Dubai Marina")
+    # Helper for location
+    location_input = st.text_input("Location", value="Dubai Marina")
     
     if property_type == "Apartment":
         unit_options = ["Studio", "1 Bedroom", "2 Bedroom", "3 Bedroom", "4 Bedroom"]
@@ -43,93 +45,144 @@ with st.sidebar:
 
 # --- HELPER: CLEAN PRICE ---
 def parse_price(text):
+    # Extracts "150k" or "150,000"
+    text = text.lower()
+    multiplier = 1
+    if 'k' in text: multiplier = 1000
+    if 'm' in text: multiplier = 1000000
+    
     clean = re.sub(r'[^\d.]', '', text)
     if clean:
-        return int(float(clean))
+        return int(float(clean) * multiplier)
     return 0
 
-# --- METHOD 1: GOOGLE TRANSLATE PROXY ---
-def fetch_via_translate(target_url):
-    # We ask Google Translate to fetch Bayut for us
-    proxy_url = f"https://translate.google.com/translate?sl=auto&tl=en&u={target_url}"
+# --- HELPER: SMART SLUGIFIER ---
+def get_propsearch_slug(raw_loc):
+    # PropSearch is picky. We map common abbreviations to full names.
+    lookup = {
+        "jvc": "jumeirah-village-circle",
+        "jlt": "jumeirah-lake-towers",
+        "difc": "difc", # Actually this one is fine
+        "downtown": "downtown-dubai",
+        "business bay": "business-bay",
+        "palm jumeirah": "palm-jumeirah",
+        "dubai hills": "dubai-hills-estate",
+        "creek harbour": "dubai-creek-harbour",
+        "springs": "the-springs",
+        "meadows": "the-meadows",
+        "arabian ranches": "arabian-ranches",
+        "motor city": "motor-city",
+        "sports city": "dubai-sports-city"
+    }
+    
+    raw = raw_loc.lower().strip()
+    if raw in lookup:
+        return lookup[raw]
+    return raw.replace(" ", "-")
+
+# --- SOURCE 1: PROPSEARCH AGGREGATOR ---
+def fetch_propsearch(loc_name, unit_conf, prop_type):
+    slug = get_propsearch_slug(loc_name)
+    url = f"https://propsearch.ae/dubai/{slug}"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     try:
-        response = requests.get(proxy_url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 404:
+            return 0, f"Location '{slug}' not found on PropSearch."
+        if response.status_code != 200:
+            return 0, f"PropSearch blocked/down ({response.status_code})."
+            
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Google wraps the content in iframes or weird tags, so we search raw text
-        all_text = soup.get_text()
+        # PropSearch Table Logic
+        # We look for a table row that matches "1 Bed" or "Studio"
         
-        # Regex for "Average Yearly Rental ... AED 150,000"
-        # The proxy often adds spaces, so we are flexible
-        match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', all_text, re.IGNORECASE | re.DOTALL)
+        # Convert "1 Bedroom" -> "1 Bed"
+        search_term = unit_conf.replace("Bedroom", "Bed").replace("Studio", "Studio")
         
-        if match:
-            return parse_price(match.group(1)), "Bayut (via Google Translate)"
+        # Scan all table rows
+        rows = soup.find_all("tr")
+        debug_rows = []
+        
+        for row in rows:
+            text = row.get_text().strip()
+            debug_rows.append(text)
             
-        return 0, "Failed"
-    except:
-        return 0, "Failed"
+            # Check if row contains our unit type AND has a price
+            if search_term in text and "AED" in text:
+                # Extract the price
+                match = re.search(r'([\d,]+)\s*AED', text)
+                if match:
+                    return parse_price(match.group(1)), "Success"
+                    
+                # Alternative format: "100k"
+                match_k = re.search(r'([\d\.]+)k', text.lower())
+                if match_k:
+                    return int(float(match_k.group(1)) * 1000), "Success"
 
-# --- METHOD 2: PROPSEARCH (FALLBACK) ---
-def fetch_via_propsearch(loc_name, unit_name):
-    slug = loc_name.lower().strip().replace(" ", "-")
-    url = f"https://propsearch.ae/dubai/{slug}"
+        return 0, f"Page loaded, but table didn't match '{search_term}'. Found rows: {str(debug_rows[:3])}..."
+
+    except Exception as e:
+        return 0, str(e)
+
+# --- SOURCE 2: DUCKDUCKGO (BACKUP) ---
+def fetch_duckduckgo(loc_name, unit_conf, prop_type):
+    # Query: "Average rent 1 bedroom apartment dubai marina bayut"
+    query = f"average yearly rent {unit_conf} {prop_type} {loc_name} bayut ae"
     
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find the table row for the unit
-        # PropSearch uses "1 Bed", "2 Bed" etc.
-        search_term = unit_name.replace("Bedroom", "Bed").replace("Studio", "Studio")
-        
-        rows = soup.find_all('tr')
-        for row in rows:
-            text = row.get_text()
-            if search_term in text and "Average" not in text: # Skip header
-                # Look for price in the row
-                prices = re.findall(r'([\d,]{3,})', text)
-                if prices:
-                    # Usually the first number is the average or low end
-                    val = parse_price(prices[0])
-                    if val > 20000:
-                        return val, "PropSearch Aggregation"
-        return 0, "Failed"
-    except:
-        return 0, "Failed"
+        results = DDGS().text(query, max_results=3)
+        for r in results:
+            snippet = r.get('body', '') + " " + r.get('title', '')
+            # Look for "AED 150,000" or "150k"
+            
+            # Regex 1: AED 150,000
+            match = re.search(r'AED\s*([\d,]+)', snippet, re.IGNORECASE)
+            if match:
+                val = parse_price(match.group(1))
+                if val > 20000: return val, "DuckDuckGo Snippet"
+                
+            # Regex 2: 150k
+            match = re.search(r'([\d\.]+)k\s*yearly', snippet, re.IGNORECASE)
+            if match:
+                val = int(float(match.group(1)) * 1000)
+                if val > 20000: return val, "DuckDuckGo Snippet"
+                
+        return 0, "No data in search results."
+    except Exception as e:
+        return 0, str(e)
 
 # --- EXECUTION ---
 if calc_button:
-    # 1. Setup URLs
-    loc_slug = location.lower().strip().replace(" ", "-")
-    p_slug = "townhouses" if property_type == "Townhouse" else property_type.lower() + "s"
-    bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
-    bayut_url = f"https://www.bayut.com/property-market-analysis/transactions/rent/{bed_slug}-{p_slug}/dubai/{loc_slug}/?contract_renewal_status=New"
-    st.session_state['final_url'] = bayut_url
     
-    with st.status("🔍 Finding Market Data...", expanded=True) as status:
-        # ATTEMPT 1: Google Translate Proxy
-        st.write("Trying Google Translate Proxy...")
-        rent, source = fetch_via_translate(bayut_url)
+    with st.status("🔍 Searching Market Data...", expanded=True) as status:
+        # 1. Try PropSearch
+        st.write("Checking PropSearch...")
+        rent, msg = fetch_propsearch(location_input, unit_conf, property_type)
         
-        # ATTEMPT 2: PropSearch Fallback
+        # 2. Try DuckDuckGo if PropSearch fails
         if rent == 0:
-            st.write("Google blocked. Switching to Aggregator...")
-            rent, source = fetch_via_propsearch(location, unit_conf)
-        
+            st.write(f"PropSearch failed ({msg}). Checking Search Engine...")
+            rent, msg = fetch_duckduckgo(location_input, unit_conf, property_type)
+            
         st.session_state['scraped_rent'] = rent
-        st.session_state['data_source'] = source
+        st.session_state['debug_log'] = msg
         st.session_state['data_fetched'] = True
         
+        # Generate Verification Link
+        loc_slug = location_input.lower().strip().replace(" ", "-")
+        bed_slug = "studio" if "Studio" in unit_conf else f"{unit_conf.split()[0]}-bedroom"
+        st.session_state['final_url'] = f"https://www.bayut.com/to-rent/property/dubai/{loc_slug}/?beds={bed_slug}"
+        
         if rent > 0:
-            status.update(label=f"Data Found! Source: {source}", state="complete", expanded=False)
+            status.update(label="Data Found!", state="complete", expanded=False)
         else:
-            status.update(label="All sources blocked. Enter manually.", state="error", expanded=True)
+            status.update(label="All sources failed.", state="error", expanded=True)
 
 # --- RESULTS ---
 if st.session_state['data_fetched']:
@@ -139,10 +192,11 @@ if st.session_state['data_fetched']:
     with c1:
         if st.session_state['scraped_rent'] > 0:
             st.success(f"✅ Market Rent: **AED {st.session_state['scraped_rent']:,.0f}**")
-            st.caption(f"Source: {st.session_state['data_source']}")
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
         else:
-            st.warning("⚠️ Could not scrape. Enter manually.")
+            st.warning("⚠️ Enter Manually")
+            with st.expander("Why did it fail?"):
+                st.text(st.session_state['debug_log'])
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
