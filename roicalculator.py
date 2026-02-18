@@ -69,25 +69,26 @@ def scrape_data(bayut_url):
             page.goto(cache_url, timeout=45000)
             
             try:
-                # Get the full text content of the page
-                full_text = page.inner_text()
+                # FIXED: Use content() instead of inner_text()
+                content = page.content()
                 browser.close()
 
-                if "404." in full_text and "That’s an error" in full_text:
-                    return 0, full_text, "Page not found in Google Cache."
+                if "404." in content and "That’s an error" in content:
+                    return 0, content, "Page not found in Google Cache."
 
-                # --- NEW REGEX LOGIC ---
-                # Look specifically for: Average Yearly Rental [spaces] AED [spaces] NUMBER
-                # Matches: "Average Yearly Rental AED 145,000"
-                # Matches: "Average Yearly Rental (AED) 145,000"
-                match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', full_text, re.IGNORECASE | re.DOTALL)
+                # Strip HTML tags to get pure text
+                clean_text = re.sub('<[^<]+?>', ' ', content)
+                clean_text = re.sub(r'\s+', ' ', clean_text) # Collapse spaces
+
+                # REGEX: Look for "Average Yearly Rental AED 150,000"
+                match = re.search(r'Average Yearly Rental.*?AED\s*([\d,]+)', clean_text, re.IGNORECASE)
                 
                 if match:
                     raw_num = match.group(1)
                     val = parse_clean_number(raw_num)
-                    return val, full_text, None
+                    return val, clean_text, None
                 
-                return 0, full_text, "Regex did not find 'Average Yearly Rental ... AED ... Number'"
+                return 0, clean_text, "Regex did not find 'Average Yearly Rental ... AED ... Number'"
 
             except Exception as e:
                 browser.close()
@@ -108,7 +109,7 @@ if calc_button:
     with st.status("🔍 Checking Google Cache...", expanded=True) as status:
         rent, raw_text, error = scrape_data(target_url)
         st.session_state['scraped_rent'] = rent
-        st.session_state['debug_text'] = raw_text # Save for debugging
+        st.session_state['debug_text'] = raw_text 
         st.session_state['data_fetched'] = True
         
         if rent > 0:
@@ -127,9 +128,8 @@ if st.session_state['data_fetched']:
             final_rent = st.number_input("Annual Rent", value=float(st.session_state['scraped_rent']))
         else:
             st.warning("⚠️ Enter Manually")
-            # DEBUGGER: Show the text we found so we can fix the regex if needed
-            with st.expander("🔍 View Scraped Text (Why did it fail?)"):
-                st.text(st.session_state['debug_text'][:2000]) # Show first 2000 chars
+            with st.expander("🔍 View Scraped Text"):
+                st.text(st.session_state['debug_text'][:2000])
             final_rent = st.number_input("Manual Rent", value=0.0)
             
     with c2:
